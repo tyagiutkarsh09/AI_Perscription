@@ -1,0 +1,25 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.python/
+python-*-amd64.exe
+python-*-embed-amd64.zip
+python-install.log
+
+# Node
+node_modules/
+dist/
+build/
+
+# Test/cache artifacts
+.pytest_cache/
+
+# OS / editor
+.DS_Store

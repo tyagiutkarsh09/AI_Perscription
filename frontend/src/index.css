@@ -1,0 +1,610 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap");
+
+:root {
+  --paper: #f7f9fa;
+  --surface: #ffffff;
+  --ink: #111827;
+  --ink-muted: #5b6b7b;
+  --hairline: #e3e8ec;
+  --hairline-soft: #eef2f4;
+  --accent: #0f766e;
+  --accent-weak: #e6f1ef;
+  --safe: #0e7a4b;
+  --safe-weak: #e7f3ec;
+  --warn: #b45309;
+  --warn-weak: #fbf0e4;
+  --severe: #b42318;
+  --severe-weak: #fbeae8;
+  --unknown: #6b7280;
+  --unknown-weak: #f1f3f5;
+  --shadow: 0 1px 3px rgba(17, 24, 39, 0.06), 0 4px 16px rgba(17, 24, 39, 0.06);
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at top right, var(--accent-weak), transparent 18rem),
+    var(--paper);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  background: transparent;
+}
+
+button,
+input,
+textarea,
+a {
+  font: inherit;
+}
+
+button,
+input,
+textarea {
+  border-radius: 6px;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: 16px 16px 112px;
+}
+
+.top-banner {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.top-banner__error {
+  color: var(--severe);
+}
+
+.console-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr) minmax(260px, 300px);
+  gap: 16px;
+  align-items: start;
+}
+
+.panel {
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 16px;
+}
+
+.left-rail,
+.center-column,
+.right-rail {
+  display: grid;
+  gap: 16px;
+}
+
+.eyebrow {
+  display: inline-block;
+  margin-bottom: 8px;
+  color: var(--ink-muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+h2 {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.muted {
+  color: var(--ink-muted);
+  font-size: 12px;
+}
+
+.mode-pill,
+.rx-flag,
+.safety-count {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.mode-pill,
+.rx-flag--accent {
+  background: var(--accent-weak);
+  color: var(--accent);
+}
+
+.rx-flag--unknown,
+.safety-count {
+  background: var(--unknown-weak);
+  color: var(--unknown);
+}
+
+.form-grid,
+.rx-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.form-grid {
+  grid-template-columns: 1fr;
+}
+
+.input-group {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.input-group span {
+  color: var(--ink-muted);
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid var(--hairline);
+  padding: 10px 12px;
+  color: var(--ink);
+  background: var(--surface);
+  resize: vertical;
+}
+
+textarea::placeholder,
+input::placeholder {
+  color: var(--ink-muted);
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  border: 1px solid var(--hairline);
+  background: var(--surface);
+  padding: 0 14px;
+  color: var(--ink);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.button--accent {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--surface);
+}
+
+.button--ghost {
+  background: var(--surface);
+}
+
+.patient-header,
+.section-header,
+.header-meta,
+.rx-card__topline,
+.rx-card__footer,
+.sign-bar,
+.sign-bar__copy,
+.sign-bar__actions,
+.safety-row__main,
+.safety-row__line,
+.ack-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.header-meta {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  color: var(--ink-muted);
+  font-family: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--hairline-soft);
+  border-radius: 8px;
+}
+
+.field--wash {
+  background: var(--accent-weak);
+  animation: ai-wash 1s ease-out 1;
+}
+
+.field-label {
+  color: var(--ink-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.field-value {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.field-value--mono,
+.coverage__label {
+  font-family: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.rx-list,
+.safety-list,
+.ack-list {
+  display: grid;
+  gap: 12px;
+}
+
+.rx-card {
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 16px;
+  background: var(--surface);
+}
+
+.rx-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 16px 0;
+}
+
+.rx-instructions {
+  display: grid;
+  gap: 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--hairline-soft);
+}
+
+.rx-evidence {
+  color: var(--warn);
+  font-size: 12px;
+}
+
+.inline-banner {
+  border-left: 3px solid var(--unknown);
+  padding-left: 8px;
+  color: var(--unknown);
+  font-size: 12px;
+}
+
+.coverage {
+  min-width: 220px;
+}
+
+.coverage__label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.coverage__label--warn {
+  color: var(--warn);
+}
+
+.coverage__track {
+  height: 4px;
+  background: var(--hairline-soft);
+}
+
+.coverage__fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.safety-panel {
+  position: sticky;
+  top: 16px;
+}
+
+.safety-row {
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.safety-row--safe {
+  background: var(--safe-weak);
+  border-color: var(--safe);
+}
+
+.safety-row--warn {
+  background: var(--warn-weak);
+  border-color: var(--warn);
+}
+
+.safety-row--severe {
+  background: var(--severe-weak);
+  border-color: var(--severe);
+}
+
+.safety-row--unknown {
+  background: var(--unknown-weak);
+  border-color: var(--unknown);
+}
+
+.safety-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+.safety-label,
+.safety-state {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.safety-row__main {
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+.safety-row__line {
+  justify-content: flex-start;
+}
+
+.safety-detail {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--hairline-soft);
+  display: grid;
+  gap: 8px;
+}
+
+.sign-bar {
+  position: fixed;
+  left: 16px;
+  right: 16px;
+  bottom: 16px;
+  z-index: 20;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 12px 16px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.sign-bar__icon {
+  color: var(--accent);
+}
+
+.ack-sheet {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: end center;
+  padding: 16px;
+  background: rgba(17, 24, 39, 0.2);
+}
+
+.ack-sheet__card {
+  width: min(680px, 100%);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 16px;
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 12px;
+  animation: sheet-up 0.2s ease-out 1;
+}
+
+.ack-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border: 1px solid var(--hairline-soft);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+@keyframes ai-wash {
+  from {
+    background: var(--accent-weak);
+  }
+  to {
+    background: transparent;
+  }
+}
+
+@keyframes sheet-up {
+  from {
+    transform: translateY(12px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@media (max-width: 1100px) {
+  .console-layout {
+    grid-template-columns: minmax(240px, 280px) minmax(0, 1fr);
+  }
+
+  .right-rail {
+    grid-column: 1 / -1;
+    order: -1;
+  }
+
+  .safety-panel {
+    position: static;
+  }
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    padding-bottom: 148px;
+  }
+
+  .console-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .patient-header,
+  .section-header,
+  .sign-bar,
+  .sign-bar__actions {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .rx-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .header-meta,
+  .top-banner {
+    justify-content: flex-start;
+    flex-direction: column;
+  }
+
+  .right-rail {
+    order: 0;
+  }
+}
+
+.mode-switch {
+  display: inline-flex;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  margin: 0.35rem 0 0.6rem;
+  border: 1px solid var(--hairline);
+  border-radius: 0.6rem;
+  background: var(--hairline-soft);
+}
+
+.mode-tab {
+  border: 0;
+  background: transparent;
+  color: var(--ink-muted);
+  font: inherit;
+  font-weight: 600;
+  padding: 0.35rem 0.9rem;
+  border-radius: 0.45rem;
+  cursor: pointer;
+}
+
+.mode-tab--active {
+  background: var(--surface);
+  color: var(--accent);
+  box-shadow: var(--shadow);
+}
+
+.mode-tab:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.manual-med {
+  border: 1px solid var(--hairline);
+  border-radius: 0.7rem;
+  padding: 0.9rem;
+  margin-top: 0.75rem;
+}
+
+.manual-med legend {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0 0.4rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--ink-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.manual-med__wide {
+  grid-column: 1 / -1;
+}
+
+.manual-med select,
+.manual-med input {
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--hairline);
+  border-radius: 0.45rem;
+  color: var(--ink);
+  background: var(--surface);
+  font: inherit;
+}
+
+.manual-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-top: 0.9rem;
+}
+
+.link-button {
+  border: 0;
+  background: transparent;
+  color: var(--severe);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
