@@ -32,6 +32,19 @@ def test_seed_reference_data_is_self_consistent():
     )
 
 
+def test_seed_brands_cover_common_indian_brand_to_generic_mappings():
+    mappings = {row["brand_name"]: row["ingredient"] for row in BRANDS}
+
+    assert mappings == {
+        "Dolo-650": "paracetamol",
+        "Crocin 650": "paracetamol",
+        "Calpol 650": "paracetamol",
+        "Brufen 400": "ibuprofen",
+        "Mox 500": "amoxicillin",
+    }
+    assert all(row["source"] for row in BRANDS)
+
+
 def test_seed_loader_is_idempotent():
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
@@ -47,7 +60,7 @@ def test_seed_loader_is_idempotent():
             for model in (Formulary, BrandCatalog, Interaction, AllergyClass)
         } == {
             "formulary": 20,
-            "brand_catalog": 2,
+            "brand_catalog": 5,
             "interactions": 1,
             "allergy_classes": 1,
         }

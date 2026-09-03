@@ -92,10 +92,12 @@ class MedicineDraft:
     duration: str | None = None
     instructions: str | None = None
     evidence_segment_ids: tuple[str, ...] = ()
+    id: str | None = None
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "MedicineDraft":
         return cls(
+            id=value.get("id"),
             ingredient=value.get("ingredient"),
             brand=value.get("brand"),
             strength=value.get("strength"),
@@ -132,7 +134,7 @@ class PrescriptionDraft:
 class STTProvider(Protocol):
     def stream(self, audio: bytes) -> Iterator[TranscriptChunk]: ...
 
-    def transcribe(self, audio_file: bytes) -> Transcript: ...
+    def transcribe(self, audio_file: bytes, content_type: str = "audio/wav") -> Transcript: ...
 
 
 @runtime_checkable
@@ -270,7 +272,7 @@ class FakeSTT:
     def __init__(self, responses: Mapping[Any, str | Transcript] | None = None):
         self.responses = dict(responses or {})
 
-    def transcribe(self, audio_file: bytes) -> Transcript:
+    def transcribe(self, audio_file: bytes, content_type: str = "audio/wav") -> Transcript:
         response = self.responses.get(audio_file, audio_file.decode(errors="replace"))
         return response if isinstance(response, Transcript) else Transcript(response, (TranscriptChunk(response),))
 
@@ -320,7 +322,7 @@ class DeepgramSTT:
         self.catalog = catalog
         self.base_url = base_url
 
-    def transcribe(self, audio_file: bytes) -> Transcript:
+    def transcribe(self, audio_file: bytes, content_type: str = "audio/wav") -> Transcript:
         if not self.api_key:
             raise ValueError("DEEPGRAM_API_KEY is required")
         own_client = self.client is None
@@ -329,7 +331,7 @@ class DeepgramSTT:
             response = client.post(
                 self.base_url,
                 content=audio_file,
-                headers={"Authorization": f"Token {self.api_key}", "Content-Type": "audio/wav"},
+                headers={"Authorization": f"Token {self.api_key}", "Content-Type": content_type},
                 params={"model": "nova-3", "smart_format": "true", "diarize": "true"},
             )
             response.raise_for_status()

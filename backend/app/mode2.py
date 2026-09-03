@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import re
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
@@ -34,6 +34,7 @@ from .providers import (
     UncoveredResult,
     get_drug_knowledge_provider,
     get_llm_provider,
+    get_stt_provider,
     strip_pii,
 )
 from .safety import (
@@ -82,6 +83,7 @@ class SignInput(BaseModel):
 
 
 class ManualMedicineInput(BaseModel):
+    id: str | None = None
     brand: str | None = None
     generic: str | None = None
     strength: str | None = None
@@ -103,6 +105,11 @@ class ManualDraftInput(BaseModel):
     diagnosis: str | None = None
     patient: PatientInput
     doctor: DoctorInput
+    medicines: list[ManualMedicineInput] = Field(min_length=1)
+
+
+class EditDraftInput(BaseModel):
+    diagnosis: str | None = None
     medicines: list[ManualMedicineInput] = Field(min_length=1)
 
 
@@ -275,11 +282,29 @@ def _event_rows(session: Session, prescription: Prescription) -> list[SafetyEven
     )
 
 
+def _active_event_ids(session: Session, prescription: Prescription) -> set[str] | None:
+    latest = session.scalar(
+        select(AuditLog)
+        .where(
+            AuditLog.entity_id == prescription.id,
+            AuditLog.action.in_(("prescription_drafted", "prescription_edited")),
+        )
+        .order_by(AuditLog.at.desc(), AuditLog.id.desc())
+    )
+    if latest is None or not isinstance(latest.after, dict) or "safety_event_ids" not in latest.after:
+        return None
+    return set(latest.after.get("safety_event_ids") or ())
+
+
 def _events_json(session: Session, prescription: Prescription) -> list[dict]:
-    rows = _event_rows(session, prescription)
+    all_rows = _event_rows(session, prescription)
+    rows = all_rows
+    active_ids = _active_event_ids(session, prescription)
+    if active_ids is not None:
+        rows = [row for row in rows if row.id in active_ids]
     acknowledgments = {
         (row.type, row.message, row.prescription_item_id): row
-        for row in rows
+        for row in all_rows
         if row.acknowledged
     }
     items = {
@@ -288,16 +313,15 @@ def _events_json(session: Session, prescription: Prescription) -> list[dict]:
             select(PrescriptionItem).where(PrescriptionItem.prescription_id == prescription.id)
         )
     }
-    return [
-        _serialize_event(
-            row,
-            acknowledgments.get((row.type, row.message, row.prescription_item_id)),
-            items.get(row.prescription_item_id, "multiple medicines"),
-            session,
-        )
-        for row in rows
-        if not row.acknowledged
-    ]
+    result = []
+    for row in rows:
+        if row.acknowledged:
+            continue
+        acknowledgment = acknowledgments.get((row.type, row.message, row.prescription_item_id))
+        if acknowledgment and acknowledgment.shown_at < row.shown_at:
+            acknowledgment = None
+        result.append(_serialize_event(row, acknowledgment, items.get(row.prescription_item_id, "multiple medicines"), session))
+    return result
 
 
 def _doctor_for(session: Session, prescription: Prescription, name: str, registration_no: str) -> Doctor:
@@ -333,6 +357,148 @@ def _resolve_medicine(
     return resolved, brand_row
 
 
+def _medicine_drafts(values: list[ManualMedicineInput]) -> list[MedicineDraft]:
+    return [
+        MedicineDraft(
+            id=value.id,
+            ingredient=value.generic or None,
+            brand=value.brand or None,
+            strength=value.strength,
+            form=value.form,
+            route=value.route,
+            dose=value.dose,
+            frequency=value.frequency,
+            duration=value.duration,
+            instructions=value.instructions,
+            evidence_segment_ids=(),
+        )
+        for value in values
+    ]
+
+
+def _render_medicines(
+    session: Session,
+    resolved: list[tuple[PrescriptionItem, Ingredient, float | None, float | None]],
+    uncovered: list[dict],
+) -> list[dict]:
+    medicines_json = []
+    for item, ingredient, dose_mg, doses_per_day in resolved:
+        brand_row = session.get(BrandCatalog, item.brand_id) if item.brand_id else None
+        medicines_json.append(
+            {
+                "id": item.id,
+                "brand": brand_row.brand_name if brand_row else None,
+                "ingredient": ingredient.name,
+                "strength": item.strength,
+                "form": item.form,
+                "route": item.route,
+                "dose": item.dose,
+                "frequency": item.frequency,
+                "duration": item.duration,
+                "instructions": item.instructions,
+                "single_dose_mg": dose_mg,
+                "daily_dose_mg": dose_mg * doses_per_day if dose_mg is not None and doses_per_day is not None else None,
+            }
+        )
+    for entry in uncovered:
+        dose_mg, doses_per_day = entry["single_dose_mg"], entry["doses_per_day"]
+        medicines_json.append(
+            {
+                "id": entry["id"],
+                "name": entry["name"],
+                "brand": entry["brand"],
+                "ingredient": None,
+                "strength": entry["strength"],
+                "form": entry["form"],
+                "route": entry["route"],
+                "dose": entry["dose"],
+                "frequency": entry["frequency"],
+                "duration": entry["duration"],
+                "instructions": entry["instructions"],
+                "single_dose_mg": dose_mg,
+                "daily_dose_mg": dose_mg * doses_per_day if dose_mg is not None and doses_per_day is not None else None,
+            }
+        )
+    return medicines_json
+
+
+def _resolve_and_check(
+    session: Session,
+    prescription: Prescription,
+    patient: PatientInput,
+    medicines: list[MedicineDraft],
+    now: datetime,
+) -> tuple[list[tuple[PrescriptionItem, Ingredient, float | None, float | None]], list[dict], list[SafetyEventRow]]:
+    knowledge = get_drug_knowledge_provider(session)
+    resolved = []
+    uncovered = []
+    for md in medicines:
+        ingredient, brand_row = _resolve_medicine(md, knowledge, session)
+        strength = md.strength or (brand_row.strength if brand_row else "")
+        dose_mg = _dose_mg(md.dose, strength)
+        doses_per_day = _doses_per_day(md.frequency)
+        form = md.form or (brand_row.form if brand_row else "")
+        if ingredient is None:
+            uncovered.append({
+                "id": md.id or new_id(), "name": (md.brand or md.ingredient or "").strip(),
+                "brand": brand_row.brand_name if brand_row else None, "strength": strength,
+                "form": form, "route": md.route or "oral", "dose": md.dose or "",
+                "frequency": md.frequency or "", "duration": md.duration or "",
+                "instructions": md.instructions, "single_dose_mg": dose_mg,
+                "doses_per_day": doses_per_day,
+            })
+            continue
+        item = session.get(PrescriptionItem, md.id) if md.id else None
+        if item is None or item.prescription_id != prescription.id:
+            item = PrescriptionItem(prescription_id=prescription.id, ingredient_id=ingredient.id,
+                brand_id=brand_row.id if brand_row else None, strength=strength, form=form,
+                route=md.route or "oral", dose=md.dose or "", frequency=md.frequency or "",
+                duration=md.duration or "", instructions=md.instructions,
+                evidence_segment_ids=list(md.evidence_segment_ids), evidence_status="linked")
+            session.add(item)
+        else:
+            item.ingredient_id = ingredient.id
+            item.brand_id = brand_row.id if brand_row else None
+            item.strength, item.form = strength, form
+            item.route, item.dose = md.route or "oral", md.dose or ""
+            item.frequency, item.duration = md.frequency or "", md.duration or ""
+            item.instructions = md.instructions
+        session.flush()
+        resolved.append((item, ingredient, dose_mg, doses_per_day))
+
+    ingredients = [ingredient for _, ingredient, _, _ in resolved]
+    interactions = [r for r in knowledge.interactions(ingredients) if isinstance(r, InteractionResult)]
+    conflicts = [r for r in knowledge.allergy_conflicts(ingredients, patient.allergies) if isinstance(r, AllergyConflict)]
+    safety_medicines = []
+    for _, ingredient, dose_mg, doses_per_day in resolved:
+        limits = knowledge.dose_limits(ingredient, patient.age, patient.weight_kg)
+        safety_medicines.append(Medicine(
+            ingredient.name or "", dose_mg=dose_mg, doses_per_day=doses_per_day,
+            limits=DoseLimits(
+                float(limits.max_single_dose) if limits.max_single_dose is not None else None,
+                float(limits.max_daily_dose) if limits.max_daily_dose is not None else None,
+                float(limits.mg_per_kg) if limits.mg_per_kg is not None else None,
+                limits.min_age, limits.max_age),
+            allergy_classes=tuple(c.class_name for c in conflicts if c.ingredient == ingredient.name),
+            interactions=tuple(InteractionRule(r.ingredient_b, r.severity, r.description)
+                for r in interactions if r.ingredient_a == ingredient.name),
+        ))
+    safety_medicines.extend(Medicine(entry["name"], covered=False) for entry in uncovered)
+    safety = evaluate(safety_medicines, PatientFacts(patient.age, patient.weight_kg, tuple(patient.allergies)))
+    rows = []
+    for event in safety:
+        item_id = next((item.id for item, ingredient, _, _ in resolved if ingredient.name == event.medicine), None)
+        if item_id is None and resolved and event.type != "uncovered":
+            item_id = resolved[0][0].id
+        row = SafetyEventRow(encounter_id=prescription.encounter_id, prescription_item_id=item_id,
+            type=event.type, severity=event.severity, message=event.message, shown_at=now,
+            acknowledged=False, acknowledged_by=None, acknowledged_at=None, override_reason=None)
+        session.add(row)
+        rows.append(row)
+    session.flush()
+    return resolved, uncovered, rows
+
+
 def persist_draft(
     session: Session,
     *,
@@ -349,7 +515,6 @@ def persist_draft(
     generics only, records append-only safety events + audit, and returns the review
     payload. Uncovered medicines surface a "verify manually" event (never hard-blocked,
     never a false pass)."""
-    knowledge = get_drug_knowledge_provider(session)
     now = utcnow()
 
     doctor_row = Doctor(
@@ -390,116 +555,10 @@ def persist_draft(
     session.add(prescription)
     session.flush()
 
-    resolved: list[tuple[PrescriptionItem, Ingredient, float | None, float | None]] = []
-    uncovered: list[dict] = []
-    for md in medicines:
-        ingredient, brand_row = _resolve_medicine(md, knowledge, session)
-        strength = md.strength or (brand_row.strength if brand_row else "")
-        dose_mg = _dose_mg(md.dose, strength)
-        doses_per_day = _doses_per_day(md.frequency)
-        form = md.form or (brand_row.form if brand_row else "")
-        if ingredient is None:
-            uncovered.append(
-                {
-                    "id": new_id(),
-                    "name": (md.brand or md.ingredient or "").strip(),
-                    "brand": brand_row.brand_name if brand_row else None,
-                    "strength": strength,
-                    "form": form,
-                    "route": md.route or "oral",
-                    "dose": md.dose or "",
-                    "frequency": md.frequency or "",
-                    "duration": md.duration or "",
-                    "instructions": md.instructions,
-                    "single_dose_mg": dose_mg,
-                    "doses_per_day": doses_per_day,
-                }
-            )
-            continue
-        item = PrescriptionItem(
-            prescription_id=prescription.id,
-            ingredient_id=ingredient.id,
-            brand_id=brand_row.id if brand_row else None,
-            strength=strength,
-            form=form,
-            route=md.route or "oral",
-            dose=md.dose or "",
-            frequency=md.frequency or "",
-            duration=md.duration or "",
-            instructions=md.instructions,
-            evidence_segment_ids=list(md.evidence_segment_ids),
-            evidence_status="linked",
-        )
-        session.add(item)
-        session.flush()
-        resolved.append((item, ingredient, dose_mg, doses_per_day))
-
-    ingredients = [ingredient for _, ingredient, _, _ in resolved]
-    interactions = [
-        result
-        for result in knowledge.interactions(ingredients)
-        if isinstance(result, InteractionResult)
-    ]
-    conflicts = [
-        result
-        for result in knowledge.allergy_conflicts(ingredients, patient.allergies)
-        if isinstance(result, AllergyConflict)
-    ]
-    safety_medicines = []
-    for _, ingredient, dose_mg, doses_per_day in resolved:
-        limits = knowledge.dose_limits(ingredient, patient.age, patient.weight_kg)
-        safety_medicines.append(
-            Medicine(
-                ingredient.name or "",
-                dose_mg=dose_mg,
-                doses_per_day=doses_per_day,
-                limits=DoseLimits(
-                    float(limits.max_single_dose) if limits.max_single_dose is not None else None,
-                    float(limits.max_daily_dose) if limits.max_daily_dose is not None else None,
-                    float(limits.mg_per_kg) if limits.mg_per_kg is not None else None,
-                    limits.min_age,
-                    limits.max_age,
-                ),
-                allergy_classes=tuple(
-                    conflict.class_name for conflict in conflicts if conflict.ingredient == ingredient.name
-                ),
-                interactions=tuple(
-                    InteractionRule(result.ingredient_b, result.severity, result.description)
-                    for result in interactions
-                    if result.ingredient_a == ingredient.name
-                ),
-            )
-        )
-    for entry in uncovered:
-        safety_medicines.append(Medicine(entry["name"], covered=False))
-
-    safety = evaluate(
-        safety_medicines,
-        PatientFacts(patient.age, patient.weight_kg, tuple(patient.allergies)),
+    resolved, uncovered, safety_rows = _resolve_and_check(
+        session, prescription, patient, medicines, now
     )
-    for event in safety:
-        item_id = next(
-            (item.id for item, ingredient, _, _ in resolved if ingredient.name == event.medicine),
-            None,
-        )
-        # Combination events (e.g. "warfarin + ibuprofen") match no single item; anchor
-        # them to the first item for linkage. Uncovered events have no item -> stay null.
-        if item_id is None and resolved and event.type != "uncovered":
-            item_id = resolved[0][0].id
-        session.add(
-            SafetyEventRow(
-                encounter_id=encounter.id,
-                prescription_item_id=item_id,
-                type=event.type,
-                severity=event.severity,
-                message=event.message,
-                shown_at=now,
-                acknowledged=False,
-                acknowledged_by=None,
-                acknowledged_at=None,
-                override_reason=None,
-            )
-        )
+    medicines_json = _render_medicines(session, resolved, uncovered)
     session.add(
         AuditLog(
             actor_id=doctor_row.id,
@@ -507,50 +566,18 @@ def persist_draft(
             entity_type="prescription",
             entity_id=prescription.id,
             before=None,
-            after={"source": source, "diagnosis": diagnosis},
+            after={
+                "source": source,
+                "diagnosis": diagnosis,
+                "patient": patient.model_dump(),
+                "medicines": medicines_json,
+                "safety_event_ids": [row.id for row in safety_rows],
+            },
             at=now,
         )
     )
     session.commit()
 
-    medicines_json = []
-    for item, ingredient, dose_mg, doses_per_day in resolved:
-        brand_row = session.get(BrandCatalog, item.brand_id) if item.brand_id else None
-        medicines_json.append(
-            {
-                "id": item.id,
-                "brand": brand_row.brand_name if brand_row else None,
-                "ingredient": ingredient.name,
-                "strength": item.strength,
-                "form": item.form,
-                "route": item.route,
-                "dose": item.dose,
-                "frequency": item.frequency,
-                "duration": item.duration,
-                "instructions": item.instructions,
-                "single_dose_mg": dose_mg,
-                "daily_dose_mg": dose_mg * doses_per_day if dose_mg is not None and doses_per_day is not None else None,
-            }
-        )
-    for entry in uncovered:
-        dose_mg = entry["single_dose_mg"]
-        doses_per_day = entry["doses_per_day"]
-        medicines_json.append(
-            {
-                "id": entry["id"],
-                "brand": entry["brand"],
-                "ingredient": None,
-                "strength": entry["strength"],
-                "form": entry["form"],
-                "route": entry["route"],
-                "dose": entry["dose"],
-                "frequency": entry["frequency"],
-                "duration": entry["duration"],
-                "instructions": entry["instructions"],
-                "single_dose_mg": dose_mg,
-                "daily_dose_mg": dose_mg * doses_per_day if dose_mg is not None and doses_per_day is not None else None,
-            }
-        )
     return {
         "prescription_id": prescription.id,
         "encounter_id": encounter.id,
@@ -562,9 +589,8 @@ def persist_draft(
     }
 
 
-@router.post("/mode2/draft")
-def create_draft(payload: DraftInput, session: Session = Depends(get_session)):
-    corrected = correct_drug_names(payload.text, session)
+def _create_voice_draft(payload: DraftInput, session: Session, text: str) -> dict:
+    corrected = correct_drug_names(text, session)
     matched_brand = _matching_brand(corrected, session)
     fake_draft = _fake_draft(corrected, matched_brand)
     minimized_text = minimize_clinical_text(corrected, payload.patient)
@@ -589,23 +615,36 @@ def create_draft(payload: DraftInput, session: Session = Depends(get_session)):
     )
 
 
+@router.post("/mode2/draft")
+def create_draft(payload: DraftInput, session: Session = Depends(get_session)):
+    return _create_voice_draft(payload, session, payload.text)
+
+
+@router.post("/mode2/audio-draft")
+async def create_audio_draft(
+    audio: UploadFile = File(...),
+    patient: str = Form(...),
+    doctor: str = Form(...),
+    session: Session = Depends(get_session),
+):
+    try:
+        patient_input = PatientInput.model_validate(json.loads(patient))
+        doctor_input = DoctorInput.model_validate(json.loads(doctor))
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise HTTPException(422, "patient and doctor must be valid JSON") from exc
+    transcript = get_stt_provider(session).transcribe(
+        await audio.read(), audio.content_type or "application/octet-stream"
+    )
+    return _create_voice_draft(
+        DraftInput(text=transcript.text, patient=patient_input, doctor=doctor_input),
+        session,
+        transcript.text,
+    )
+
+
 @router.post("/manual/draft")
 def create_manual_draft(payload: ManualDraftInput, session: Session = Depends(get_session)):
-    medicines = [
-        MedicineDraft(
-            ingredient=(m.generic or None),
-            brand=(m.brand or None),
-            strength=m.strength,
-            form=m.form,
-            route=m.route,
-            dose=m.dose,
-            frequency=m.frequency,
-            duration=m.duration,
-            instructions=m.instructions,
-            evidence_segment_ids=(),
-        )
-        for m in payload.medicines
-    ]
+    medicines = _medicine_drafts(payload.medicines)
     return persist_draft(
         session,
         patient=payload.patient,
@@ -615,6 +654,61 @@ def create_manual_draft(payload: ManualDraftInput, session: Session = Depends(ge
         source="manual",
         medicines=medicines,
     )
+
+
+@router.patch("/prescriptions/{prescription_id}/draft")
+def edit_draft(
+    prescription_id: str,
+    payload: EditDraftInput,
+    session: Session = Depends(get_session),
+):
+    prescription = session.get(Prescription, prescription_id)
+    if prescription is None:
+        raise HTTPException(404, "Prescription not found")
+    if prescription.locked or prescription.status == "signed":
+        raise HTTPException(409, "Signed prescriptions are locked")
+    encounter = session.get(Encounter, prescription.encounter_id)
+    patient_row = session.get(Patient, encounter.patient_id)
+    doctor = session.get(Doctor, encounter.doctor_id)
+    previous = session.scalar(
+        select(AuditLog)
+        .where(AuditLog.entity_id == prescription.id, AuditLog.action.in_(("prescription_drafted", "prescription_edited")))
+        .order_by(AuditLog.at.desc(), AuditLog.id.desc())
+    )
+    previous_data = previous.after if previous and isinstance(previous.after, dict) else {}
+    previous_patient = previous_data.get("patient", {})
+    patient = PatientInput(
+        name=patient_row.name, patient_id=previous_patient.get("patient_id"), age=patient_row.age,
+        sex=patient_row.sex, weight_kg=float(patient_row.weight_kg) if patient_row.weight_kg is not None else None,
+        contact=patient_row.contact, allergies=previous_patient.get("allergies", []),
+    )
+    now = utcnow()
+    resolved, uncovered, safety_rows = _resolve_and_check(
+        session, prescription, patient, _medicine_drafts(payload.medicines), now
+    )
+    medicines_json = _render_medicines(session, resolved, uncovered)
+    old_medicines = previous_data.get("medicines", [])
+    encounter.diagnosis = payload.diagnosis if payload.diagnosis is not None else encounter.diagnosis
+    session.add(
+        AuditLog(
+            actor_id=doctor.id,
+            action="prescription_edited",
+            entity_type="prescription",
+            entity_id=prescription.id,
+            before={"diagnosis": previous_data.get("diagnosis"), "medicines": old_medicines},
+            after={
+                "source": "edit", "diagnosis": encounter.diagnosis, "patient": patient.model_dump(),
+                "medicines": medicines_json, "safety_event_ids": [row.id for row in safety_rows],
+            },
+            at=now,
+        )
+    )
+    session.commit()
+    return {
+        "prescription_id": prescription.id, "encounter_id": encounter.id,
+        "patient": patient.model_dump(), "diagnosis": encounter.diagnosis,
+        "medicines": medicines_json, "safety_events": _events_json(session, prescription), "signed": False,
+    }
 
 
 @router.get("/catalog")
@@ -690,9 +784,23 @@ def sign(prescription_id: str, payload: SignInput, session: Session = Depends(ge
         )
     encounter = session.get(Encounter, prescription.encounter_id)
     patient = session.get(Patient, encounter.patient_id)
-    items = list(
-        session.scalars(select(PrescriptionItem).where(PrescriptionItem.prescription_id == prescription.id))
+    snapshot = session.scalar(
+        select(AuditLog)
+        .where(AuditLog.entity_id == prescription.id, AuditLog.action.in_(("prescription_drafted", "prescription_edited")))
+        .order_by(AuditLog.at.desc(), AuditLog.id.desc())
     )
+    snapshot_medicines = (snapshot.after or {}).get("medicines", []) if snapshot else []
+    items = list(session.scalars(select(PrescriptionItem).where(PrescriptionItem.prescription_id == prescription.id)))
+    pdf_medicines = snapshot_medicines or [
+        {
+            "ingredient": session.get(Formulary, item.ingredient_id).ingredient_name,
+            "strength": item.strength,
+            "dose": item.dose,
+            "frequency": item.frequency,
+            "duration": item.duration,
+        }
+        for item in items
+    ]
     now = utcnow()
     path = _pdf_path(prescription.id)
     lines = [
@@ -700,8 +808,8 @@ def sign(prescription_id: str, payload: SignInput, session: Session = Depends(ge
         f"Patient: {patient.name}",
         f"Diagnosis: {encounter.diagnosis or ''}",
         *[
-            f"{session.get(Formulary, item.ingredient_id).ingredient_name} {item.strength} - {item.dose}, {item.frequency}, {item.duration}"
-            for item in items
+            f"{medicine.get('ingredient') or medicine.get('brand') or medicine.get('name') or 'Unknown medicine'} {medicine.get('strength') or ''} - {medicine.get('dose') or ''}, {medicine.get('frequency') or ''}, {medicine.get('duration') or ''}"
+            for medicine in pdf_medicines
         ],
         f"Signed by: {doctor.name}",
         f"Registration: {doctor.registration_no}",

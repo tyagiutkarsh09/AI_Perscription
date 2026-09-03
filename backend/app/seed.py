@@ -88,6 +88,30 @@ BRANDS = [
         "manufacturer": "Haleon",
         "source": "https://www.haleonhealthpartner.com/en-in/pain-relief/brands/crocin/products/crocin-650/",
     },
+    {
+        "brand_name": "Calpol 650",
+        "ingredient": "paracetamol",
+        "strength": "650 mg",
+        "form": "tablet",
+        "manufacturer": "GlaxoSmithKline Pharmaceuticals Limited",
+        "source": "https://india-pharma.gsk.com/media/3g4mchgd/calpol-tablets-oral-suspension-and-paediatric-drops.pdf",
+    },
+    {
+        "brand_name": "Brufen 400",
+        "ingredient": "ibuprofen",
+        "strength": "400 mg",
+        "form": "tablet",
+        "manufacturer": "Abbott India Limited",
+        "source": "https://www.abbott.in/products/b.html",
+    },
+    {
+        "brand_name": "Mox 500",
+        "ingredient": "amoxicillin",
+        "strength": "500 mg",
+        "form": "capsule",
+        "manufacturer": "Sun Pharmaceutical Industries Ltd.",
+        "source": "https://sunpharma.com/india-products/",
+    },
 ]
 
 INTERACTIONS = [

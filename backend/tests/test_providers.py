@@ -126,6 +126,17 @@ def test_deepgram_transcribe_uses_http_adapter():
     client.close()
 
 
+def test_deepgram_transcribe_forwards_audio_content_type():
+    def handler(request):
+        assert request.headers["Content-Type"] == "audio/webm"
+        return httpx.Response(200, json={"results": {"channels": [{"alternatives": [{"transcript": "fever"}]}]}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    stt = DeepgramSTT(api_key="test", client=client)
+    assert stt.transcribe(b"audio", "audio/webm").text == "fever"
+    client.close()
+
+
 def test_build_providers_uses_environment_selectors(monkeypatch, session):
     monkeypatch.setenv("STT_BACKEND", "fake")
     monkeypatch.setenv("LLM_BACKEND", "fake")

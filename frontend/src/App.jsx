@@ -129,8 +129,29 @@ function Field({ label, value, mono = false, wash = false }) {
   );
 }
 
-function MedicineCard({ medicine, locked }) {
+function MedicineCard({ medicine, locked, onChange, brands }) {
   const uncovered = !medicine.ingredient;
+
+  const input = (label, field, mono = false) => (
+    field === "brand" ? (
+      <label className="field field--editable" key={field}>
+        <span className="field-label">{label}</span>
+        <select value={medicine.brand || ""} onChange={(event) => onChange(field, event.target.value)} disabled={locked}>
+          <option value="">Generic only</option>
+          {brands.map((brand) => <option key={brand.brand_name} value={brand.brand_name}>{brand.brand_name}</option>)}
+        </select>
+      </label>
+    ) : (
+    <label className={`field field--editable ${mono ? "field--mono" : ""}`}>
+      <span className="field-label">{label}</span>
+      <input
+        value={medicine[field] || ""}
+        onChange={(event) => onChange(field, event.target.value)}
+        disabled={locked}
+      />
+    </label>
+    )
+  );
 
   return (
     <article className="rx-card">
@@ -141,20 +162,26 @@ function MedicineCard({ medicine, locked }) {
         </span>
       </div>
       <div className="rx-grid">
-        <Field label="Ingredient" value={medicine.ingredient || "Not resolved"} mono={!uncovered} wash />
-        <Field label="Brand" value={medicine.brand || "Not provided"} wash />
-        <Field label="Strength" value={medicine.strength || "Not provided"} mono wash />
-        <Field label="Form" value={medicine.form || "Not provided"} wash />
-        <Field label="Route" value={medicine.route || "Not provided"} wash />
-        <Field label="Dose" value={medicine.dose || "Not provided"} mono wash />
-        <Field label="Frequency" value={medicine.frequency || "Not provided"} mono wash />
-        <Field label="Duration" value={medicine.duration || "Not provided"} mono wash />
+        {input("Ingredient", "ingredient", !uncovered)}
+        {input("Brand", "brand")}
+        {input("Strength", "strength", true)}
+        {input("Form", "form")}
+        {input("Route", "route")}
+        {input("Dose", "dose", true)}
+        {input("Frequency", "frequency", true)}
+        {input("Duration", "duration", true)}
         <Field label="Single dose" value={medicine.single_dose_mg ? `${medicine.single_dose_mg} mg` : "Not calculated"} mono />
         <Field label="Daily total" value={medicine.daily_dose_mg ? `${medicine.daily_dose_mg} mg/day` : "Not calculated"} mono />
       </div>
       <div className="rx-instructions">
         <span className="field-label">Instructions</span>
-        <p>{medicine.instructions || "No patient instructions captured."}</p>
+        <textarea
+          rows="2"
+          value={medicine.instructions || ""}
+          onChange={(event) => onChange("instructions", event.target.value)}
+          disabled={locked}
+          placeholder="No patient instructions captured."
+        />
       </div>
       <div className="rx-card__footer">
         <span className="rx-evidence">{locked ? "Locked signed item" : "Evidence link pending transcript integration"}</span>
@@ -179,12 +206,17 @@ export default function App() {
   const [isDrafting, setIsDrafting] = useState(false);
   const [isAcknowledging, setIsAcknowledging] = useState(false);
   const [isSigning, setIsSigning] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isDirty, setIsDirty] = useState(false);
   const [showAckSheet, setShowAckSheet] = useState(false);
   const [ackReason, setAckReason] = useState("");
   const [selectedEventIds, setSelectedEventIds] = useState([]);
   const [statusMessage, setStatusMessage] = useState("Ready for dictation review.");
   const [errorMessage, setErrorMessage] = useState("");
   const ackHeadingRef = useRef(null);
+  const recorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
 
   const unresolvedEvents = useMemo(
     () => events.filter((event) => event.must_acknowledge && !event.acknowledged),
@@ -266,6 +298,106 @@ export default function App() {
     );
   }
 
+  function applyDraft(data, fallbackDiagnosis = "") {
+    setDraft(data);
+    setPatient(data.patient || patient);
+    setDiagnosis(data.diagnosis || fallbackDiagnosis);
+    setEvents((data.safety_events || []).map(normalizeEvent));
+    setSelectedEventIds([]);
+    setAckReason("");
+    setShowAckSheet(false);
+    setIsDirty(false);
+    setStatusMessage("Draft staged. Review required before signing.");
+  }
+
+  async function saveEditedDraft() {
+    if (!draft?.prescription_id || locked || !isDirty) return true;
+    setIsSaving(true);
+    try {
+      const response = await fetch(`/api/prescriptions/${draft.prescription_id}/draft`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          diagnosis,
+          medicines: draft.medicines.map(({ id, ...medicine }) => ({
+            id,
+            brand: medicine.brand || null,
+            generic: medicine.ingredient || null,
+            strength: medicine.strength || null,
+            form: medicine.form || null,
+            route: medicine.route || null,
+            dose: medicine.dose || null,
+            frequency: medicine.frequency || null,
+            duration: medicine.duration || null,
+            instructions: medicine.instructions || null,
+          })),
+        }),
+      });
+      if (!response.ok) throw new Error(`Save draft failed (${response.status})`);
+      applyDraft(await response.json(), diagnosis);
+      setStatusMessage("Draft saved and safety rechecked.");
+      return true;
+    } catch (error) {
+      setErrorMessage(error.message || "Draft could not be saved.");
+      return false;
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  function updateStagedMedicine(index, field, value) {
+    setDraft((current) => ({
+      ...current,
+      medicines: current.medicines.map((medicine, position) =>
+        position === index ? { ...medicine, [field]: value } : medicine,
+      ),
+    }));
+    setIsDirty(true);
+  }
+
+  async function finishRecording() {
+    if (!recorderRef.current) return;
+    recorderRef.current.stop();
+    setIsRecording(false);
+  }
+
+  async function startRecording() {
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      setErrorMessage("Audio recording is unavailable. Paste the transcript instead.");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (event) => event.data.size && audioChunksRef.current.push(event.data);
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop());
+        setIsDrafting(true);
+        setErrorMessage("");
+        try {
+          const body = new FormData();
+          body.append("audio", new Blob(audioChunksRef.current, { type: recorder.mimeType || "audio/webm" }), "dictation.webm");
+          body.append("patient", JSON.stringify(patient));
+          body.append("doctor", JSON.stringify(doctor));
+          const response = await fetch("/api/mode2/audio-draft", { method: "POST", body });
+          if (!response.ok) throw new Error(`Audio draft failed (${response.status})`);
+          applyDraft(await response.json());
+        } catch (error) {
+          setErrorMessage(error.message || "Audio could not be transcribed. Paste the transcript instead.");
+        } finally {
+          setIsDrafting(false);
+        }
+      };
+      recorderRef.current = recorder;
+      recorder.start();
+      setIsRecording(true);
+      setStatusMessage("Recording dictation...");
+    } catch (error) {
+      setErrorMessage(error.message || "Microphone access was not granted. Paste the transcript instead.");
+    }
+  }
+
   async function createManualDraft(event) {
     event.preventDefault();
     setIsDrafting(true);
@@ -296,14 +428,7 @@ export default function App() {
         );
       }
       const data = await response.json();
-      setDraft(data);
-      setPatient(data.patient || patient);
-      setDiagnosis(data.diagnosis || diagnosis);
-      setEvents((data.safety_events || []).map(normalizeEvent));
-      setSelectedEventIds([]);
-      setAckReason("");
-      setShowAckSheet(false);
-      setStatusMessage("Draft staged. Review required before signing.");
+      applyDraft(data, diagnosis);
     } catch (error) {
       setErrorMessage(error.message || "Draft could not be created.");
       setStatusMessage("Draft failed.");
@@ -332,14 +457,7 @@ export default function App() {
         throw new Error(`Draft request failed (${response.status})`);
       }
       const data = await response.json();
-      setDraft(data);
-      setPatient(data.patient || patient);
-      setDiagnosis(data.diagnosis || "");
-      setEvents((data.safety_events || []).map(normalizeEvent));
-      setSelectedEventIds([]);
-      setAckReason("");
-      setShowAckSheet(false);
-      setStatusMessage("Draft staged. Review required before signing.");
+      applyDraft(data);
     } catch (error) {
       setErrorMessage(error.message || "Draft could not be created.");
       setStatusMessage("Draft failed.");
@@ -354,6 +472,7 @@ export default function App() {
       return;
     }
 
+    if (!(await saveEditedDraft())) return;
     setIsSigning(true);
     setErrorMessage("");
 
@@ -542,9 +661,14 @@ export default function App() {
                   disabled={locked}
                 />
               </label>
-              <button className="button button--accent" type="submit" disabled={isDrafting || locked}>
+              <div className="dictation-actions">
+                <button className="button button--accent" type="button" onClick={isRecording ? finishRecording : startRecording} disabled={isDrafting || locked}>
+                  {isRecording ? "Stop recording" : "Record dictation"}
+                </button>
+                <button className="button button--ghost" type="submit" disabled={isDrafting || locked}>
                 {isDrafting ? "Building draft..." : "Create draft"}
-              </button>
+                </button>
+              </div>
             </form>
           ) : (
             <form className="panel manual-panel" onSubmit={createManualDraft}>
@@ -661,7 +785,7 @@ export default function App() {
               <textarea
                 rows="3"
                 value={diagnosis}
-                onChange={(event) => setDiagnosis(event.target.value)}
+                onChange={(event) => { setDiagnosis(event.target.value); setIsDirty(true); }}
                 placeholder="Editable diagnosis appears here."
                 disabled={locked || !draft}
               />
@@ -686,8 +810,14 @@ export default function App() {
 
             {draft?.medicines?.length ? (
               <div className="rx-list">
-                {draft.medicines.map((medicine) => (
-                  <MedicineCard key={medicine.id || `${medicine.brand}-${medicine.ingredient}`} medicine={medicine} locked={locked} />
+                {draft.medicines.map((medicine, index) => (
+                  <MedicineCard
+                    key={medicine.id || `${medicine.brand}-${medicine.ingredient}`}
+                    medicine={medicine}
+                    locked={locked}
+                    brands={catalog.brands}
+                    onChange={(field, value) => updateStagedMedicine(index, field, value)}
+                  />
                 ))}
               </div>
             ) : (
@@ -745,8 +875,8 @@ export default function App() {
               Open PDF
             </a>
           ) : (
-            <button className="button button--ghost" type="button" disabled>
-              Save draft
+            <button className="button button--ghost" type="button" onClick={saveEditedDraft} disabled={locked || isSaving || !draft}>
+              {isSaving ? "Saving..." : "Save draft"}
             </button>
           )}
           <button className="button button--accent" type="button" onClick={signPrescription} disabled={isSigning}>

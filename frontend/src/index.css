@@ -47,8 +47,28 @@ a {
 
 button,
 input,
-textarea {
+textarea,
+select {
   border-radius: 6px;
+}
+
+.field--editable input,
+.field--editable select,
+.field--editable textarea {
+  background: var(--accent-weak);
+  font: inherit;
+}
+
+.field--mono input,
+.field--mono select {
+  font-family: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.dictation-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 button:focus-visible,

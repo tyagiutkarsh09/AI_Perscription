@@ -7,8 +7,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.main import app, get_session
+import app.mode2 as mode2_module
 from app.mode2 import PatientInput, minimize_clinical_text
-from app.models import AuditLog, Base, Encounter, Prescription, SafetyEvent
+from app.models import AuditLog, Base, Encounter, Prescription, PrescriptionItem, SafetyEvent
+from app.providers import Transcript
 from app.seed import load_reference_data
 
 
@@ -234,3 +236,134 @@ def test_tablet_count_multiplies_catalog_strength_before_safety(client):
     dose_events = [event for event in draft["safety_events"] if event["type"] == "dose"]
     assert len(dose_events) == 1
     assert dose_events[0]["severity"] == "severe"
+
+
+def test_audio_dictation_uses_stt_then_normal_extraction_path(client):
+    http, _, _ = client
+    payload = draft_payload("ignored client text")
+    response = http.post(
+        "/api/mode2/audio-draft",
+        data={"patient": __import__("json").dumps(payload["patient"]), "doctor": __import__("json").dumps(payload["doctor"])},
+        files={"audio": ("dictation.wav", b"patient has a headache, give Dolo 650, twice daily for 3 days", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    draft = response.json()
+    assert draft["diagnosis"] == "headache"
+    assert draft["medicines"][0]["brand"] == "Dolo-650"
+    assert draft["medicines"][0]["ingredient"] == "paracetamol"
+
+
+def test_audio_dictation_forwards_browser_mime_type_to_stt(client, monkeypatch):
+    http, _, _ = client
+    received = {}
+
+    class CapturingSTT:
+        def transcribe(self, audio, content_type=None):
+            received.update(audio=audio, content_type=content_type)
+            return Transcript("patient has a headache, give Dolo 650, twice daily for 3 days")
+
+    monkeypatch.setattr(mode2_module, "get_stt_provider", lambda session: CapturingSTT())
+    payload = draft_payload("ignored client text")
+    response = http.post(
+        "/api/mode2/audio-draft",
+        data={"patient": __import__("json").dumps(payload["patient"]), "doctor": __import__("json").dumps(payload["doctor"])},
+        files={"audio": ("dictation.webm", b"webm audio", "audio/webm")},
+    )
+
+    assert response.status_code == 200
+    assert received == {"audio": b"webm audio", "content_type": "audio/webm"}
+
+
+def test_editing_staged_draft_persists_rechecks_and_audits(client):
+    http, factory, _ = client
+    draft = http.post(
+        "/api/mode2/draft", json=draft_payload("give Dolo 650 as 1300 mg once daily")
+    ).json()
+    assert any(event["type"] == "dose" for event in draft["safety_events"])
+
+    edited = http.patch(
+        f"/api/prescriptions/{draft['prescription_id']}/draft",
+        json={
+            "diagnosis": "headache",
+            "medicines": [{
+                "id": draft["medicines"][0]["id"],
+                "brand": "Dolo-650",
+                "generic": "paracetamol",
+                "strength": "650 mg",
+                "form": "tablet",
+                "route": "oral",
+                "dose": "1 tablet",
+                "frequency": "twice daily",
+                "duration": "3 days",
+                "instructions": "Take after food",
+            }],
+        },
+    )
+
+    assert edited.status_code == 200
+    result = edited.json()
+    assert result["safety_events"] == []
+    assert result["medicines"][0]["dose"] == "1 tablet"
+    with factory() as session:
+        item = session.get(PrescriptionItem, draft["medicines"][0]["id"])
+        assert item.dose == "1 tablet"
+        assert session.scalar(
+            select(func.count()).select_from(AuditLog).where(AuditLog.action == "prescription_edited")
+        ) == 1
+
+
+def test_edit_reintroducing_same_warning_requires_new_acknowledgment(client):
+    http, _, _ = client
+    draft = http.post(
+        "/api/mode2/draft", json=draft_payload("give Dolo 650 as 1300 mg once daily")
+    ).json()
+    warning = draft["safety_events"][0]
+    http.post(
+        f"/api/prescriptions/{draft['prescription_id']}/acknowledge",
+        json={"event_ids": [warning["id"]], "doctor_name": "Dr Rao", "registration_no": "KMC-1234", "reason": "Reviewed"},
+    )
+    edited = http.patch(
+        f"/api/prescriptions/{draft['prescription_id']}/draft",
+        json={"diagnosis": "headache", "medicines": [{
+            "id": draft["medicines"][0]["id"], "brand": "Dolo-650", "generic": "paracetamol",
+            "strength": "650 mg", "form": "tablet", "route": "oral", "dose": "1300 mg",
+            "frequency": "once daily", "duration": "3 days",
+        }]},
+    )
+    assert edited.status_code == 200
+    assert len([event for event in edited.json()["safety_events"] if not event["acknowledged"]]) == 1
+
+
+def test_uncovered_medicine_is_retained_in_signed_pdf(client):
+    http, _, _ = client
+    payload = draft_payload("prescribe an unknown medicine")
+    response = http.post(
+        "/api/manual/draft",
+        json={
+            "diagnosis": "unknown condition",
+            "patient": payload["patient"],
+            "doctor": payload["doctor"],
+            "medicines": [{"generic": "Mysterymol", "dose": "1 tablet", "frequency": "once daily", "duration": "3 days"}],
+        },
+    )
+    assert response.status_code == 200
+    draft = response.json()
+    assert draft["medicines"][0]["ingredient"] is None
+    signed = http.post(
+        f"/api/prescriptions/{draft['prescription_id']}/sign",
+        json={"doctor_name": "Dr Rao", "registration_no": "KMC-1234"},
+    )
+    assert signed.status_code == 409
+    warning = draft["safety_events"][0]
+    http.post(
+        f"/api/prescriptions/{draft['prescription_id']}/acknowledge",
+        json={"event_ids": [warning["id"]], "doctor_name": "Dr Rao", "registration_no": "KMC-1234", "reason": "Verified manually"},
+    )
+    signed = http.post(
+        f"/api/prescriptions/{draft['prescription_id']}/sign",
+        json={"doctor_name": "Dr Rao", "registration_no": "KMC-1234"},
+    )
+    assert signed.status_code == 200
+    pdf = http.get(signed.json()["pdf_url"])
+    assert b"Mysterymol" in pdf.content
