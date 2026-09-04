@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 import json
@@ -5,7 +6,16 @@ import os
 from pathlib import Path
 import re
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
@@ -22,6 +32,7 @@ from .models import (
     Prescription,
     PrescriptionItem,
     SafetyEvent as SafetyEventRow,
+    Transcript as TranscriptRow,
     new_id,
 )
 from .pdf import write_pdf
@@ -152,7 +163,9 @@ NUMBER_WORDS = {"one": 1.0, "two": 2.0, "three": 3.0, "four": 4.0}
 
 
 def _tablet_count(text: str | None) -> float | None:
-    match = re.search(r"\b(\d+(?:\.\d+)?|one|two|three|four)\s+tablets?\b", text or "", re.IGNORECASE)
+    match = re.search(
+        r"\b(\d+(?:\.\d+)?|one|two|three|four)\s+(?:tablets?|capsules?)\b", text or "", re.IGNORECASE
+    )
     if not match:
         return None
     token = match.group(1).casefold()
@@ -454,7 +467,8 @@ def _resolve_and_check(
                 brand_id=brand_row.id if brand_row else None, strength=strength, form=form,
                 route=md.route or "oral", dose=md.dose or "", frequency=md.frequency or "",
                 duration=md.duration or "", instructions=md.instructions,
-                evidence_segment_ids=list(md.evidence_segment_ids), evidence_status="linked")
+                evidence_segment_ids=list(md.evidence_segment_ids),
+                evidence_status="linked" if md.evidence_segment_ids else "missing_context")
             session.add(item)
         else:
             item.ingredient_id = ingredient.id
@@ -847,3 +861,280 @@ def prescription_pdf(prescription_id: str, session: Session = Depends(get_sessio
     if not path.is_file():
         raise HTTPException(404, "Signed PDF not found")
     return FileResponse(path, media_type="application/pdf", filename=f"prescription-{prescription_id}.pdf")
+
+
+# ── Mode 3: ambient conversation ──────────────────────────────────────────────
+# Consent-gated recording → diarized live transcript over WebSocket → one
+# full-context extraction at "End encounter", with each medicine linked to the
+# transcript segment(s) that justify it. Resolve/safety/ack/sign reuse Mode 2.
+
+
+class ConsentInput(BaseModel):
+    patient: PatientInput
+    doctor: DoctorInput
+    consent: bool = False
+
+
+def _speaker_label(speaker) -> str:
+    """Map a provider speaker tag to a rail label. Fake STT emits Doctor/Patient;
+    Deepgram diarization emits 0/1."""
+    if speaker is None:
+        return "Speaker"
+    text = str(speaker).strip().casefold()
+    if text in ("doctor", "0", "speaker 0", "speaker0"):
+        return "Doctor"
+    if text in ("patient", "1", "speaker 1", "speaker1"):
+        return "Patient"
+    return str(speaker).strip().title()
+
+
+def _link_evidence(name: str | None, segments: list[dict]) -> list[str]:
+    """Deterministically link a medicine to the transcript segments that name it
+    (normalized token match). Not the LLM's job to invent segment ids — a name that
+    appears nowhere in the conversation stays unlinked → 'missing context'."""
+    key = " ".join(_normal_parts(name or ""))
+    if not key:
+        return []
+    return [seg["id"] for seg in segments if key in " ".join(_normal_parts(seg["text"]))]
+
+
+def _ambient_draft(segments: list[dict], session: Session) -> dict:
+    """Heuristic extraction over the whole conversation (doubles as the fake-LLM
+    response so the keyless demo works; the real path is OpenAI structured outputs)."""
+    full = " ".join(seg["text"] for seg in segments)
+    seen: set[str] = set()
+    medicines = []
+    for seg in segments:
+        brand = _matching_brand(seg["text"], session)
+        if brand is None or brand.brand_name in seen:
+            continue
+        seen.add(brand.brand_name)
+        medicines.append(_fake_draft(seg["text"], brand)["medicines"][0])
+    return {
+        "diagnosis": "headache" if "headache" in full.casefold() else None,
+        "patient_facts": {},
+        "medicines": medicines,
+    }
+
+
+def _extract_ambient(segments: list[dict], patient: PatientInput, session: Session):
+    full = " ".join(seg["text"] for seg in segments)
+    minimized = minimize_clinical_text(full, patient)
+    llm = get_llm_provider(fake_responses={minimized: _ambient_draft(segments, session)})
+    clinical = strip_pii(
+        {
+            "patient_name": patient.name,
+            "patient_id": patient.patient_id,
+            "contact": patient.contact,
+            "clinical_text": minimized,
+        }
+    )["clinical_text"]
+    return llm.extract_prescription(clinical, "ambient")
+
+
+def _ambient_patient(session: Session, encounter: Encounter) -> PatientInput:
+    """Rebuild the patient facts (allergies live in the consent snapshot, not the
+    patients row) so end-of-encounter safety runs on the same inputs Mode 2 uses."""
+    patient_row = session.get(Patient, encounter.patient_id)
+    consent = session.scalar(
+        select(AuditLog)
+        .where(AuditLog.entity_id == encounter.id, AuditLog.action == "recording_consent_captured")
+        .order_by(AuditLog.at.desc(), AuditLog.id.desc())
+    )
+    stored = consent.after.get("patient", {}) if consent and isinstance(consent.after, dict) else {}
+    return PatientInput(
+        name=patient_row.name,
+        patient_id=stored.get("patient_id"),
+        age=patient_row.age,
+        sex=patient_row.sex,
+        weight_kg=float(patient_row.weight_kg) if patient_row.weight_kg is not None else None,
+        contact=patient_row.contact,
+        allergies=stored.get("allergies", []),
+    )
+
+
+def _attach_evidence(medicines_json: list[dict], resolved: list, segments: list[dict]) -> None:
+    by_item = {
+        item.id: (list(item.evidence_segment_ids or []), item.evidence_status)
+        for item, _, _, _ in resolved
+    }
+    for med in medicines_json:
+        if med["id"] in by_item:
+            ids, status = by_item[med["id"]]
+        else:  # uncovered medicine has no item row — recompute from its name
+            name = med.get("brand") or med.get("ingredient") or med.get("name") or ""
+            ids = _link_evidence(name, segments)
+            status = "linked" if ids else "missing_context"
+        med["evidence_segment_ids"] = ids
+        med["evidence_status"] = status
+
+
+def _coverage(medicines_json: list[dict]) -> dict:
+    total = len(medicines_json)
+    linked = sum(1 for med in medicines_json if med["evidence_status"] == "linked")
+    missing = total - linked
+    label = f"{linked} of {total} linked"
+    if missing:
+        label += f" · {missing} missing context"
+    return {"total": total, "linked": linked, "missing": missing, "label": label}
+
+
+def persist_ambient_draft(
+    session: Session,
+    *,
+    encounter: Encounter,
+    patient: PatientInput,
+    diagnosis: str | None,
+    segments: list[dict],
+    medicines: list[MedicineDraft],
+) -> dict:
+    now = utcnow()
+    encounter.ended_at = now
+    encounter.diagnosis = diagnosis if diagnosis is not None else encounter.diagnosis
+    doctor_row = session.get(Doctor, encounter.doctor_id)
+    prescription = Prescription(
+        encounter_id=encounter.id, status="draft", signed_by=None,
+        signed_registration_no=None, signed_at=None, pdf_url=None, locked=False,
+    )
+    session.add(prescription)
+    session.flush()
+    resolved, uncovered, safety_rows = _resolve_and_check(
+        session, prescription, patient, medicines, now
+    )
+    medicines_json = _render_medicines(session, resolved, uncovered)
+    _attach_evidence(medicines_json, resolved, segments)
+    session.add(
+        AuditLog(
+            actor_id=doctor_row.id,
+            action="prescription_drafted",
+            entity_type="prescription",
+            entity_id=prescription.id,
+            before=None,
+            after={
+                "source": "ambient",
+                "diagnosis": encounter.diagnosis,
+                "patient": patient.model_dump(),
+                "medicines": medicines_json,
+                "safety_event_ids": [row.id for row in safety_rows],
+            },
+            at=now,
+        )
+    )
+    session.commit()
+    return {
+        "prescription_id": prescription.id,
+        "encounter_id": encounter.id,
+        "patient": patient.model_dump(),
+        "diagnosis": encounter.diagnosis,
+        "medicines": medicines_json,
+        "safety_events": _events_json(session, prescription),
+        "transcript": segments,
+        "coverage": _coverage(medicines_json),
+        "signed": False,
+    }
+
+
+@router.post("/mode3/consent")
+def start_ambient_encounter(payload: ConsentInput, session: Session = Depends(get_session)):
+    """Per-encounter consent gate. No consent → no encounter, so no recording."""
+    if not payload.consent:
+        raise HTTPException(422, "Recording consent is required before an ambient encounter can start.")
+    now = utcnow()
+    doctor_row = Doctor(name=payload.doctor.name, registration_no=payload.doctor.registration_no, preferences={})
+    patient_row = Patient(
+        name=payload.patient.name, age=payload.patient.age, dob=None, sex=payload.patient.sex,
+        weight_kg=payload.patient.weight_kg, contact=payload.patient.contact,
+    )
+    session.add_all((doctor_row, patient_row))
+    session.flush()
+    encounter = Encounter(
+        patient_id=patient_row.id, doctor_id=doctor_row.id, mode="ambient", status="draft",
+        recording_consent=True, consent_at=now, started_at=now, ended_at=None, diagnosis=None,
+    )
+    session.add(encounter)
+    session.flush()
+    session.add(TranscriptRow(encounter_id=encounter.id, segments=[]))
+    session.add(
+        AuditLog(
+            actor_id=doctor_row.id, action="recording_consent_captured", entity_type="encounter",
+            entity_id=encounter.id, before=None,
+            after={"recording_consent": True, "consent_at": now.isoformat(), "patient": payload.patient.model_dump()},
+            at=now,
+        )
+    )
+    session.commit()
+    return {"encounter_id": encounter.id, "consent_at": now.isoformat() + "Z", "recording_consent": True}
+
+
+@router.websocket("/mode3/encounters/{encounter_id}/stream")
+async def stream_ambient(
+    websocket: WebSocket, encounter_id: str, session: Session = Depends(get_session)
+):
+    """Live diarized transcript. Each audio (or, for the keyless demo, text) frame is
+    transcribed, drug-name-corrected, appended as a segment, and echoed back labeled."""
+    await websocket.accept()
+    encounter = session.get(Encounter, encounter_id)
+    if encounter is None or not encounter.recording_consent:
+        await websocket.send_json({"error": "consent_required"})
+        await websocket.close(code=1008)
+        return
+    transcript = session.scalar(
+        select(TranscriptRow).where(TranscriptRow.encounter_id == encounter_id)
+    )
+    if transcript is None:
+        transcript = TranscriptRow(encounter_id=encounter_id, segments=[])
+        session.add(transcript)
+        session.flush()
+    stt = get_stt_provider(session)
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+            payload = message.get("bytes")
+            if payload is None:
+                payload = (message.get("text") or "").encode()
+            for chunk in stt.stream(payload):
+                corrected = correct_drug_names(chunk.text, session)
+                if not corrected.strip():
+                    continue
+                segments = list(transcript.segments or [])
+                char_start = sum(len(seg["text"]) + 1 for seg in segments)
+                segment = {
+                    "id": f"seg-{len(segments)}",
+                    "speaker": _speaker_label(chunk.speaker),
+                    "text": corrected,
+                    "t_start": chunk.start,
+                    "t_end": chunk.end,
+                    "char_start": char_start,
+                    "char_end": char_start + len(corrected),
+                }
+                segments.append(segment)
+                transcript.segments = segments  # reassign so SQLAlchemy sees the JSON change
+                session.commit()
+                await websocket.send_json({"segment": segment})
+    except WebSocketDisconnect:
+        pass
+
+
+@router.post("/mode3/encounters/{encounter_id}/end")
+def end_ambient_encounter(encounter_id: str, session: Session = Depends(get_session)):
+    encounter = session.get(Encounter, encounter_id)
+    if encounter is None or encounter.mode != "ambient":
+        raise HTTPException(404, "Ambient encounter not found")
+    if encounter.status == "signed":
+        raise HTTPException(409, "Signed prescriptions are locked")
+    transcript = session.scalar(
+        select(TranscriptRow).where(TranscriptRow.encounter_id == encounter_id)
+    )
+    segments = list(transcript.segments or []) if transcript else []
+    patient = _ambient_patient(session, encounter)
+    draft = _extract_ambient(segments, patient, session)
+    medicines = [
+        replace(md, evidence_segment_ids=tuple(_link_evidence(md.brand or md.ingredient, segments)))
+        for md in draft.medicines
+    ]
+    return persist_ambient_draft(
+        session, encounter=encounter, patient=patient,
+        diagnosis=draft.diagnosis, segments=segments, medicines=medicines,
+    )

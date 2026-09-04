@@ -330,6 +330,82 @@ input::placeholder {
   font-size: 12px;
 }
 
+.inline-banner--warn {
+  border-left-color: var(--warn);
+  color: var(--warn);
+}
+
+/* Required-but-missing fields: marked, never blocking. */
+.input-group--missing span {
+  color: var(--warn);
+}
+
+.input-group--missing input,
+.input-group--missing select,
+.input--missing {
+  border-color: var(--warn);
+  background: var(--warn-weak);
+}
+
+.rx-evidence--linked {
+  color: var(--accent);
+  font-family: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+}
+
+.ambient-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.ambient-panel code {
+  font-family: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  color: var(--ink);
+}
+
+.transcript {
+  display: grid;
+  gap: 8px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.transcript-line {
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--hairline-soft);
+  font-size: 13px;
+  animation: line-in 0.15s ease-out 1;
+}
+
+.transcript-line--doctor {
+  border-left: 3px solid var(--accent);
+}
+
+.transcript-line--patient {
+  border-left: 3px solid var(--ink-muted);
+}
+
+.transcript-speaker {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+
+@keyframes line-in {
+  from {
+    transform: translateY(4px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
 .coverage {
   min-width: 220px;
 }

@@ -268,13 +268,35 @@ class CuratedDrugKnowledge:
         return results
 
 
+_SPEAKER_LINE = re.compile(r"^\s*(doctor|patient|speaker\s*\d+|\d+)\s*[:\-]\s*(.*)$", re.IGNORECASE)
+
+
+def _diarize(text: str) -> tuple[TranscriptChunk, ...]:
+    """Split a transcript into per-utterance chunks. 'Doctor: ...' / 'Patient: ...' lines
+    carry a speaker label; unlabeled text stays one speakerless chunk. POC fake diarization —
+    real Deepgram streaming supplies per-word speaker numbers instead."""
+    chunks = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        match = _SPEAKER_LINE.match(line)
+        if match:
+            chunks.append(TranscriptChunk(match.group(2).strip(), speaker=match.group(1).strip()))
+        else:
+            chunks.append(TranscriptChunk(line.strip()))
+    return tuple(chunks) or (TranscriptChunk(text),)
+
+
 class FakeSTT:
     def __init__(self, responses: Mapping[Any, str | Transcript] | None = None):
         self.responses = dict(responses or {})
 
     def transcribe(self, audio_file: bytes, content_type: str = "audio/wav") -> Transcript:
-        response = self.responses.get(audio_file, audio_file.decode(errors="replace"))
-        return response if isinstance(response, Transcript) else Transcript(response, (TranscriptChunk(response),))
+        response = self.responses.get(audio_file)
+        if isinstance(response, Transcript):
+            return response
+        text = response if isinstance(response, str) else audio_file.decode(errors="replace")
+        return Transcript(text, _diarize(text))
 
     def stream(self, audio: bytes) -> Iterator[TranscriptChunk]:
         yield from self.transcribe(audio).chunks
